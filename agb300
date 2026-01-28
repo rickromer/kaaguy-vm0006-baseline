@@ -1,0 +1,150 @@
+// =====================================================================
+//  KA’AGUY+ · ESTRATIFICACIÓN AGB (OPCIÓN 2)
+//  Paisaje productivo con borde agrícola – VM0006 compatible
+//  Estratos: ALTO / MEDIO / BAJO stock de carbono
+//  AGB NASA/ORNL (~2010) + fracción de bosque MapBiomas
+// =====================================================================
+
+// --------------------------------------------------
+// 1) REGIÓN: Alto Paraná, Paraguay
+// --------------------------------------------------
+var region = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Paraguay'))
+  .filter(ee.Filter.eq('ADM1_NAME', 'Alto Parana'))
+  .geometry();
+
+Map.centerObject(region, 8);
+
+// --------------------------------------------------
+// 2) MAPBIOMAS – Bosque (clase 3) + filtro ≥ 1 ha
+// --------------------------------------------------
+var mb = ee.Image(
+  'projects/mapbiomas-public/assets/paraguay/collection1/' +
+  'mapbiomas_paraguay_collection1_integration_v1'
+);
+
+function bosque30m(year) {
+  var band = (year <= 2022) ? 'classification_' + year : 'classification_2022';
+  var bosque = mb.select(band).eq(3);
+  return bosque
+    .connectedPixelCount(12, true) // ≥12 px ≈ 1 ha
+    .gte(12)
+    .and(bosque)
+    .selfMask()
+    .clip(region);
+}
+
+var bosque30 = bosque30m(2022);
+
+// --------------------------------------------------
+// 3) FRACCIÓN DE BOSQUE A 300 m (paisaje con borde)
+// --------------------------------------------------
+var bosqueFrac300 = bosque30.reduceNeighborhood({
+  reducer: ee.Reducer.mean(),
+  kernel: ee.Kernel.square({ radius: 150, units: 'meters' })
+});
+
+// Umbral BAJO para incluir bordes productivos
+var bosqueMask = bosqueFrac300.gt(0.4);
+
+// --------------------------------------------------
+// 4) AGB – NASA/ORNL (≈2010, 300 m, global)
+// --------------------------------------------------
+var agb = ee.ImageCollection('NASA/ORNL/biomass_carbon_density/v1')
+  .select('agb')
+  .first();
+
+var agbForest = agb.updateMask(bosqueMask);
+
+// --------------------------------------------------
+// 5) ESTRATIFICACIÓN POR PERCENTILES (P33 / P66)
+// --------------------------------------------------
+var perc = agbForest.reduceRegion({
+  reducer: ee.Reducer.percentile([33, 66]),
+  geometry: region,
+  scale: 300,
+  maxPixels: 1e13
+});
+
+var p33 = ee.Number(perc.get('agb_p33'));
+var p66 = ee.Number(perc.get('agb_p66'));
+
+print('AGB P33 (MgC/ha):', p33);
+print('AGB P66 (MgC/ha):', p66);
+
+// Estratos: 1=ALTO, 2=MEDIO, 3=BAJO
+var estratos = ee.Image(0)
+  .where(agbForest.gt(p66), 1)
+  .where(agbForest.gte(p33).and(agbForest.lte(p66)), 2)
+  .where(agbForest.lt(p33), 3)
+  .updateMask(bosqueMask);
+
+// --------------------------------------------------
+// 6) STATS POR ESTRATO (mean + mediana)
+// --------------------------------------------------
+function statsEstrato(valor, nombre) {
+  var mask = estratos.eq(valor);
+  var s = agb.updateMask(mask).reduceRegion({
+    reducer: ee.Reducer.mean()
+      .combine(ee.Reducer.median(), '', true),
+    geometry: region,
+    scale: 300,
+    maxPixels: 1e13
+  });
+
+  var meanMgC = ee.Number(s.get('agb_mean'));
+  var medMgC  = ee.Number(s.get('agb_median'));
+
+  print(nombre + ' mean MgC/ha', meanMgC);
+  print(nombre + ' median MgC/ha', medMgC);
+  print(nombre + ' mean tCO2e/ha', meanMgC.multiply(44/12));
+  print(nombre + ' median tCO2e/ha', medMgC.multiply(44/12));
+}
+
+statsEstrato(1, 'ALTO');
+statsEstrato(2, 'MEDIO');
+statsEstrato(3, 'BAJO');
+
+// --------------------------------------------------
+// 7) VISUALIZACIÓN
+// --------------------------------------------------
+Map.addLayer(
+  bosqueFrac300,
+  { min: 0, max: 1, palette: ['ffffff', '228B22'] },
+  'Fracción de bosque (300 m)'
+);
+
+Map.addLayer(
+  estratos,
+  { min: 1, max: 3, palette: ['00441b', '41ab5d', 'c7e9c0'] },
+  'Estratos AGB (1 alto · 2 medio · 3 bajo)'
+);
+
+// --------------------------------------------------
+// 8) EXPORT PIXEL A PIXEL (lat/lon) – CSV
+// --------------------------------------------------
+var lonlat = ee.Image.pixelLonLat();
+
+var samples = agbForest
+  .addBands(estratos.rename('estrato'))
+  .addBands(lonlat)
+  .sample({
+    region: region,
+    scale: 300,
+    geometries: false,
+    tileScale: 4
+  })
+  .select(['agb', 'estrato', 'longitude', 'latitude'])
+  .map(function(f) {
+    return f.set({
+      lon: f.get('longitude'),
+      lat: f.get('latitude')
+    }).select(['agb', 'estrato', 'lon', 'lat']);
+  });
+
+Export.table.toDrive({
+  collection: samples,
+  description: 'KAAGUY_AGB_Estratos_300m_AltoParana',
+  folder: 'kaaguy_baseline',
+  fileFormat: 'CSV'
+});
