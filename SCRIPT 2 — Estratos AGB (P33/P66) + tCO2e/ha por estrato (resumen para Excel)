@@ -1,0 +1,102 @@
+// =======================================================
+// SCRIPT 2 — ESTRATOS AGB (P33/P66) + tCO2e/ha POR ESTRATO
+// AGB NASA/ORNL (≈2010) 300m + fracción de bosque MB (ventana 300m)
+// Output: 1 fila por estrato (ALTO/MEDIO/BAJO) con MgC/ha y tCO2e/ha
+// =======================================================
+
+var OUT_FOLDER = 'kaaguy_baseline';
+var AOI_ASSET = 'projects/bosques-nativos-gbaapa/assets/PRELIMINARYKAAGUY';
+
+var aoi = ee.FeatureCollection(AOI_ASSET).geometry().dissolve();
+Map.centerObject(aoi, 7);
+
+var mb = ee.Image('projects/mapbiomas-public/assets/paraguay/collection1/mapbiomas_paraguay_collection1_integration_v1');
+
+function bosque30m_2022() {
+  var b3 = mb.select('classification_2022').eq(3);
+  var mmu = b3.connectedPixelCount(12, true).gte(12);
+  return b3.and(mmu).selfMask().clip(aoi);
+}
+
+var bosque30 = bosque30m_2022();
+
+// fracción de bosque a 300m (radio 150m)
+var bosqueFrac300 = bosque30.reduceNeighborhood({
+  reducer: ee.Reducer.mean(),
+  kernel: ee.Kernel.square({ radius: 150, units: 'meters' })
+});
+
+// máscara “borde” (ajustable)
+var FRAC_THRESHOLD = 0.4;
+var bosqueMask = bosqueFrac300.gt(FRAC_THRESHOLD).selfMask();
+
+// AGB NASA/ORNL (MgC/ha)
+var agb = ee.ImageCollection('NASA/ORNL/biomass_carbon_density/v1')
+  .select('agb')
+  .first()
+  .clip(aoi);
+
+var agbForest = agb.updateMask(bosqueMask);
+
+var perc = agbForest.reduceRegion({
+  reducer: ee.Reducer.percentile([33, 66]),
+  geometry: aoi,
+  scale: 300,
+  maxPixels: 1e13
+});
+
+var p33 = ee.Number(perc.get('agb_p33'));
+var p66 = ee.Number(perc.get('agb_p66'));
+
+print('P33 MgC/ha', p33);
+print('P66 MgC/ha', p66);
+
+// 1=ALTO, 2=MEDIO, 3=BAJO
+var estratos = ee.Image(0)
+  .where(agbForest.gt(p66), 1)
+  .where(agbForest.gte(p33).and(agbForest.lte(p66)), 2)
+  .where(agbForest.lt(p33), 3)
+  .updateMask(bosqueMask)
+  .rename('estrato');
+
+function row(code, name) {
+  var mask = estratos.eq(code);
+  var s = agb.updateMask(mask).reduceRegion({
+    reducer: ee.Reducer.mean().combine(ee.Reducer.median(), '', true),
+    geometry: aoi,
+    scale: 300,
+    maxPixels: 1e13
+  });
+
+  var meanMgC = ee.Number(s.get('agb_mean'));
+  var medMgC  = ee.Number(s.get('agb_median'));
+
+  return ee.Feature(null, {
+    estrato: name,
+    code: code,
+    MgC_ha_mean: meanMgC,
+    MgC_ha_median: medMgC,
+    tCO2e_ha_mean: meanMgC.multiply(44/12),
+    tCO2e_ha_median: medMgC.multiply(44/12),
+    P33: p33,
+    P66: p66,
+    FRAC_THRESHOLD: FRAC_THRESHOLD
+  });
+}
+
+var out = ee.FeatureCollection([
+  row(1, 'ALTO'),
+  row(2, 'MEDIO'),
+  row(3, 'BAJO')
+]);
+
+print('Estratos AGB (resumen)', out);
+
+Export.table.toDrive({
+  collection: out,
+  description: 'KAAGUY_Estratos_AGB_Completo',
+  folder: OUT_FOLDER,
+  fileFormat: 'CSV'
+});
+
+Map.addLayer(estratos, {min:1, max:3, palette:['00441b','41ab5d','c7e9c0']}, 'Estratos AGB');
