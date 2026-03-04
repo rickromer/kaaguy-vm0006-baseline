@@ -1,0 +1,278 @@
+/***************************************************************
+ KA’AGUY+ — VM0006 BASELINE (PER YEAR, 3-YEAR PERSISTENCE)
+ - Export 1 CSV por año (1 fila) como tareas separadas
+ - Degradación VM0006 proxy: drop en y vs y-1 + persiste 3 años (y,y+1,y+2)
+***************************************************************/
+
+var OUT_FOLDER = 'kaaguy_baseline2';
+var AOI_ASSET  = 'projects/bosques-nativos-gbaapa/assets/PRELIMINARYKAAGUY';
+
+var BASE_START = 2014;
+var BASE_END   = 2024;   // <= poné 2024 si querés exportar hasta 2022 (por y+2)
+
+var DNDVI_THR_INIT     = -0.07; // inicio (más estricto)
+var DNDVI_THR_PERSIST  = -0.02; // persistencia (debe seguir >=0.02 por debajo de y-1)
+var FRAC_EVENT_300     = 0.15;  // más estricto
+var FRAC_THRESHOLD     = 0.40;
+
+var DRY_START_MONTH = 6, DRY_START_DAY = 1;
+var DRY_END_MONTH   = 9, DRY_END_DAY   = 30;
+
+var CLOUD_COVER_MAX = 20; // más alineado a VM0006
+var TILE_SCALE = 16;
+
+var PROJ30  = ee.Projection('EPSG:3857').atScale(30);
+var PROJ300 = ee.Projection('EPSG:3857').atScale(300);
+
+var aoi = ee.FeatureCollection(AOI_ASSET).geometry().dissolve();
+Map.centerObject(aoi, 7);
+
+var bbox = aoi.bounds(1);
+var pxArea = ee.Image.pixelArea();
+
+function dryStart(y){ return ee.Date.fromYMD(ee.Number(y).toInt(), DRY_START_MONTH, DRY_START_DAY); }
+function dryEnd(y){   return ee.Date.fromYMD(ee.Number(y).toInt(), DRY_END_MONTH,   DRY_END_DAY);   }
+
+var aoiMask30  = ee.Image.constant(1).clip(aoi).selfMask().setDefaultProjection(PROJ30);
+var aoiMask300 = ee.Image.constant(1).clip(aoi).selfMask().setDefaultProjection(PROJ300);
+
+var mb = ee.Image('projects/mapbiomas-public/assets/paraguay/collection1/mapbiomas_paraguay_collection1_integration_v1');
+
+// ---------------- BOSQUE CORE ESTABLE (2020–2022) ----------------
+var REF_Y0 = 2020, REF_Y1 = 2021, REF_Y2 = 2022;
+
+function bosqueMB_MMU_30m(year) {
+  year = ee.Number(year).toInt();
+  var band = ee.String('classification_').cat(year.format('%d'));
+  var bandSafe = ee.String(ee.Algorithms.If(year.lte(2022), band, 'classification_2022'));
+
+  var b3  = mb.select(bandSafe).eq(3);
+  var mmu = b3.connectedPixelCount(12, true).gte(12);
+
+  return b3.and(mmu).selfMask().updateMask(aoiMask30).setDefaultProjection(PROJ30);
+}
+
+var forestStable30 = bosqueMB_MMU_30m(REF_Y0)
+  .and(bosqueMB_MMU_30m(REF_Y1))
+  .and(bosqueMB_MMU_30m(REF_Y2))
+  .selfMask()
+  .setDefaultProjection(PROJ30);
+
+var forestFrac300 = forestStable30.unmask(0)
+  .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 2048})
+  .reproject(PROJ300);
+
+var forestMask300 = forestFrac300.gt(FRAC_THRESHOLD)
+  .selfMask()
+  .updateMask(aoiMask300)
+  .setDefaultProjection(PROJ300);
+
+var bosque_ref_ha = ee.Number(
+  forestMask300.unmask(0)
+    .multiply(pxArea).divide(10000).rename('ha')
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: bbox,
+      scale: 300,
+      crs: PROJ300,
+      maxPixels: 1e13,
+      tileScale: TILE_SCALE
+    }).get('ha')
+);
+print('bosque_ref_ha:', bosque_ref_ha);
+
+// ---------------- ESTRATOS AGB (P33/P66) ----------------
+var agb = ee.ImageCollection('NASA/ORNL/biomass_carbon_density/v1')
+  .select('agb').first()
+  .clip(aoi)
+  .resample('bilinear')
+  .setDefaultProjection(PROJ300);
+
+var agbForest = agb.updateMask(forestMask300);
+
+var perc = agbForest.reduceRegion({
+  reducer: ee.Reducer.percentile([33, 66]),
+  geometry: bbox,
+  scale: 300,
+  crs: PROJ300,
+  maxPixels: 1e13,
+  tileScale: TILE_SCALE
+});
+
+var p33 = ee.Number(perc.get('agb_p33'));
+var p66 = ee.Number(perc.get('agb_p66'));
+print('P33/P66:', p33, p66);
+
+var estratos300 = ee.Image(0)
+  .where(agbForest.gt(p66), 1)
+  .where(agbForest.gte(p33).and(agbForest.lte(p66)), 2)
+  .where(agbForest.lt(p33), 3)
+  .updateMask(forestMask300)
+  .rename('estrato')
+  .setDefaultProjection(PROJ300);
+
+// ---------------- LANDSAT NDVI (QA) ----------------
+function maskLandsatL2(img) {
+  var qa = img.select('QA_PIXEL');
+  var dilated = qa.bitwiseAnd(1 << 1).neq(0);
+  var cloud   = qa.bitwiseAnd(1 << 3).neq(0);
+  var shadow  = qa.bitwiseAnd(1 << 4).neq(0);
+  var snow    = qa.bitwiseAnd(1 << 5).neq(0);
+  var mask = dilated.or(cloud).or(shadow).or(snow).not();
+
+  var sr = img.select(['SR_B4','SR_B5'], ['RED','NIR'])
+    .multiply(0.0000275).add(-0.2);
+
+  return sr.updateMask(mask).setDefaultProjection(PROJ30);
+}
+
+function landsatNDVI_dry(year){
+  year = ee.Number(year).toInt();
+
+  var c8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(aoi)
+    .filterDate(dryStart(year), dryEnd(year))
+    .filter(ee.Filter.lt('CLOUD_COVER', CLOUD_COVER_MAX))
+    .map(maskLandsatL2);
+
+  var c9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+    .filterBounds(aoi)
+    .filterDate(dryStart(year), dryEnd(year))
+    .filter(ee.Filter.lt('CLOUD_COVER', CLOUD_COVER_MAX))
+    .map(maskLandsatL2);
+
+  var col = c8.merge(c9);
+  var n = col.size();
+
+  var ndvi = ee.Image(ee.Algorithms.If(
+    n.gt(0),
+    col.median().normalizedDifference(['NIR','RED']).rename('NDVI').setDefaultProjection(PROJ30),
+    ee.Image(0).updateMask(ee.Image(0)).rename('NDVI').setDefaultProjection(PROJ30)
+  )).updateMask(aoiMask30);
+
+  return ee.Dictionary({size: n, ndvi: ndvi});
+}
+
+// ---------------- EVENTO: INIT + 3-YEAR PERSISTENCE ----------------
+function featureForYear(y){
+  y = ee.Number(y).toInt();
+  var y0 = y.subtract(1);
+  var y1 = y.add(1);
+  var y2 = y.add(2);
+
+  var d0 = landsatNDVI_dry(y0);
+  var d  = landsatNDVI_dry(y);
+  var d1 = landsatNDVI_dry(y1);
+  var d2 = landsatNDVI_dry(y2);
+
+  var n0 = ee.Number(d0.get('size'));
+  var n  = ee.Number(d.get('size'));
+  var n1 = ee.Number(d1.get('size'));
+  var n2 = ee.Number(d2.get('size'));
+
+  var valid = n0.gt(0).and(n.gt(0)).and(n1.gt(0)).and(n2.gt(0));
+
+  var nd0 = ee.Image(d0.get('ndvi'));
+  var nd  = ee.Image(d.get('ndvi'));
+  var nd1i= ee.Image(d1.get('ndvi'));
+  var nd2i= ee.Image(d2.get('ndvi'));
+
+  // drop inicial
+  var dnd_init = nd.subtract(nd0).updateMask(forestStable30).setDefaultProjection(PROJ30);
+  var init = dnd_init.lt(DNDVI_THR_INIT);
+
+  // persistencia: y+1 y y+2 siguen por debajo de y-1 por al menos DNDVI_THR_PERSIST
+  var pers1 = nd1i.subtract(nd0).updateMask(forestStable30).lt(DNDVI_THR_PERSIST);
+  var pers2 = nd2i.subtract(nd0).updateMask(forestStable30).lt(DNDVI_THR_PERSIST);
+
+  var ev30 = ee.Image(ee.Algorithms.If(
+    valid,
+    init.and(pers1).and(pers2).selfMask().setDefaultProjection(PROJ30),
+    ee.Image(0).selfMask().setDefaultProjection(PROJ30)
+  ));
+
+  var frac300 = ev30.unmask(0)
+    .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 2048})
+    .reproject(PROJ300);
+
+  var ev300 = frac300.gte(FRAC_EVENT_300)
+    .updateMask(forestMask300)
+    .selfMask()
+    .setDefaultProjection(PROJ300);
+
+  var haImg = ee.Image.cat([
+      ev300.rename('deg_total_ha'),
+      ev300.updateMask(estratos300.eq(1)).rename('deg_alto_ha'),
+      ev300.updateMask(estratos300.eq(2)).rename('deg_medio_ha'),
+      ev300.updateMask(estratos300.eq(3)).rename('deg_bajo_ha')
+    ])
+    .unmask(0)
+    .multiply(pxArea).divide(10000)
+    .setDefaultProjection(PROJ300);
+
+  var sums = haImg.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: bbox,
+    scale: 300,
+    crs: PROJ300,
+    maxPixels: 1e13,
+    tileScale: TILE_SCALE
+  });
+
+  var deg_total_ha = ee.Number(sums.get('deg_total_ha'));
+  var deg_alto_ha  = ee.Number(sums.get('deg_alto_ha'));
+  var deg_medio_ha = ee.Number(sums.get('deg_medio_ha'));
+  var deg_bajo_ha  = ee.Number(sums.get('deg_bajo_ha'));
+
+  var tasa_pct = deg_total_ha.divide(bosque_ref_ha).multiply(100);
+
+  return ee.Feature(null, {
+    anio: y,
+    anio_prev: y0,
+    anio_p1: y1,
+    anio_p2: y2,
+
+    valid: ee.Number(ee.Algorithms.If(valid, 1, 0)),
+    n_scenes_y_1: n0,
+    n_scenes_y:   n,
+    n_scenes_y1:  n1,
+    n_scenes_y2:  n2,
+
+    bosque_ref_ha: bosque_ref_ha,
+    P33_MgC_ha: p33,
+    P66_MgC_ha: p66,
+
+    deg_total_ha: deg_total_ha,
+    deg_alto_ha:  deg_alto_ha,
+    deg_medio_ha: deg_medio_ha,
+    deg_bajo_ha:  deg_bajo_ha,
+    tasa_deg_pct: tasa_pct,
+
+    DNDVI_THR_INIT: DNDVI_THR_INIT,
+    DNDVI_THR_PERSIST: DNDVI_THR_PERSIST,
+    FRAC_EVENT_300: FRAC_EVENT_300,
+    FRAC_THRESHOLD: FRAC_THRESHOLD,
+    DRY_WINDOW: 'Jun-Sep',
+    CLOUD_COVER_MAX: CLOUD_COVER_MAX,
+    FOREST_REF: 'MB class3 + MMU12 AND stable 2020-2022',
+    NOTE: 'Degradation proxy requires persistence through y+2'
+  });
+}
+
+// Export por año (ahora el último año exportable es BASE_END-2)
+var firstY = BASE_START + 1;
+var lastY  = BASE_END - 2;
+
+for (var y = firstY; y <= lastY; y++){
+  var ft = featureForYear(ee.Number(y));
+  var fc = ee.FeatureCollection([ft]).filter(ee.Filter.eq('valid', 1));
+
+  Export.table.toDrive({
+    collection: fc,
+    description: 'KAAGUY_Baseline_VM0006_3yr_' + y,
+    folder: OUT_FOLDER,
+    fileFormat: 'CSV'
+  });
+}
+
+print('Tareas creadas: ' + firstY + '–' + lastY + ' (persistencia 3 años).');
