@@ -1,0 +1,68 @@
+// =======================================================
+// KAAGUY+
+// SCRIPT 1 — BOSQUE ANUAL MAPBIOMAS (ULTRALIVIANO)
+// Preliminar MADES
+// =======================================================
+
+var OUT_FOLDER = 'kaaguy_baseline';
+var AOI_ASSET = 'projects/bosques-nativos-gbaapa/assets/PRELIMINARYKAAGUY';
+
+var START_YEAR = 2014;
+var END_YEAR   = 2022;
+
+var aoi = ee.FeatureCollection(AOI_ASSET).geometry();
+Map.centerObject(aoi, 7);
+
+var mb = ee.Image('projects/mapbiomas-public/assets/paraguay/collection1/mapbiomas_paraguay_collection1_integration_v1');
+var pxArea = ee.Image.pixelArea();
+
+function roundNum(n, dec) {
+  var f = ee.Number(10).pow(dec);
+  return ee.Number(n).multiply(f).round().divide(f);
+}
+
+function scaledInt(n, dec) {
+  var f = ee.Number(10).pow(dec);
+  return ee.Number(n).multiply(f).round().toInt64();
+}
+
+function bosqueYear(y) {
+  y = ee.Number(y).toInt();
+
+  var band = ee.String('classification_').cat(y.format('%d'));
+  var forest = mb.select(band).eq(3);
+
+  var ha = ee.Number(
+    forest.multiply(pxArea).divide(10000).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: aoi,
+      scale: 120,          // clave: más liviano
+      bestEffort: true,    // clave: deja que EE ajuste
+      maxPixels: 1e13,
+      tileScale: 16
+    }).get(band)
+  );
+
+  return ee.Feature(null, {
+    anio: y,
+    bosque_ha_x1000: scaledInt(ha, 3),
+    bosque_ha: roundNum(ha, 3),
+    fuente: 'MapBiomas Paraguay',
+    scale_m: 120
+  });
+}
+
+var years = ee.List.sequence(START_YEAR, END_YEAR);
+
+var fc = ee.FeatureCollection(years.map(function(y) {
+  return bosqueYear(y);
+}));
+
+print('Bosque anual ultraliviano', fc);
+
+Export.table.toDrive({
+  collection: fc,
+  description: 'KAAGUY_Bosque_Anual_ULTRA',
+  folder: OUT_FOLDER,
+  fileFormat: 'CSV'
+});
