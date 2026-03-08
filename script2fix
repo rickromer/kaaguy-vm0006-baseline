@@ -1,0 +1,131 @@
+// =======================================================
+// KAAGUY+
+// SCRIPT 2 — ESTRATOS AGB CORREGIDO
+// Preliminar MADES
+// Usa solo bosque 2022 de MapBiomas
+// =======================================================
+
+var OUT_FOLDER='kaaguy_baseline';
+var AOI_ASSET='projects/bosques-nativos-gbaapa/assets/PRELIMINARYKAAGUY';
+
+var aoi = ee.FeatureCollection(AOI_ASSET).geometry();
+Map.centerObject(aoi,7);
+
+var mb = ee.Image('projects/mapbiomas-public/assets/paraguay/collection1/mapbiomas_paraguay_collection1_integration_v1');
+var agb = ee.ImageCollection('NASA/ORNL/biomass_carbon_density/v1')
+  .select('agb')
+  .first()
+  .clip(aoi);
+
+// ---------- helpers ----------
+function roundNum(n,dec){
+  var f = ee.Number(10).pow(dec);
+  return ee.Number(n).multiply(f).round().divide(f);
+}
+
+function scaledInt(n,dec){
+  var f = ee.Number(10).pow(dec);
+  return ee.Number(n).multiply(f).round().toInt64();
+}
+
+// -------------------------------
+// máscara de bosque 2022
+// -------------------------------
+var bosque2022 = mb.select('classification_2022')
+  .eq(3)
+  .selfMask()
+  .clip(aoi)
+  .rename('forest');
+
+// AGB solo en bosque
+var agbForest = agb.updateMask(bosque2022);
+
+// percentiles solo sobre bosque
+var stats = agbForest.reduceRegion({
+  reducer: ee.Reducer.percentile([33,66]),
+  geometry: aoi,
+  scale: 500,
+  bestEffort: true,
+  maxPixels: 1e13,
+  tileScale: 8
+});
+
+var p33 = ee.Number(stats.get('agb_p33'));
+var p66 = ee.Number(stats.get('agb_p66'));
+
+print('P33', p33);
+print('P66', p66);
+
+// estratos solo en bosque
+var estratos = ee.Image(0)
+  .where(agbForest.gt(p66), 1)
+  .where(agbForest.gte(p33).and(agbForest.lte(p66)), 2)
+  .where(agbForest.lt(p33), 3)
+  .updateMask(bosque2022)
+  .rename('estrato');
+
+function row(code, name) {
+  var mask = estratos.eq(code);
+
+  var m = agb.updateMask(mask).reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 500,
+    bestEffort: true,
+    maxPixels: 1e13,
+    tileScale: 8
+  });
+
+  var mgc = ee.Number(m.get('agb'));
+  var co2 = mgc.multiply(44/12);
+
+  return ee.Feature(null, {
+    estrato: name,
+
+    MgC_ha_x1000: scaledInt(mgc, 3),
+    MgC_ha: roundNum(mgc, 3),
+
+    tCO2e_ha_x1000: scaledInt(co2, 3),
+    tCO2e_ha: roundNum(co2, 3),
+
+    P33_x1000: scaledInt(p33, 3),
+    P33: roundNum(p33, 3),
+
+    P66_x1000: scaledInt(p66, 3),
+    P66: roundNum(p66, 3),
+
+    bosque_ref: 'MapBiomas 2022 forest only',
+    scale_m: 500
+  });
+}
+
+var out = ee.FeatureCollection([
+  row(1,'ALTO'),
+  row(2,'MEDIO'),
+  row(3,'BAJO')
+]);
+
+print('Estratos AGB corregido', out);
+
+Export.table.toDrive({
+  collection: out,
+  description: 'KAAGUY_Estratos_AGB_CORREGIDO',
+  folder: OUT_FOLDER,
+  fileFormat: 'CSV',
+  selectors: [
+    'estrato',
+    'MgC_ha',
+    'MgC_ha_x1000',
+    'tCO2e_ha',
+    'tCO2e_ha_x1000',
+    'P33',
+    'P33_x1000',
+    'P66',
+    'P66_x1000',
+    'bosque_ref',
+    'scale_m'
+  ]
+});
+
+Map.addLayer(bosque2022, {palette:['0b6623']}, 'Bosque 2022');
+Map.addLayer(estratos, {min:1, max:3, palette:['00441b','41ab5d','c7e9c0']}, 'Estratos AGB');
